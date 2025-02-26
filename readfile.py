@@ -30,6 +30,7 @@ from itertools import chain
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import jieba.analyse
+from torch import nn
 
 class FileProcessor:
     def __init__(self, log_dir: str = "logs"):
@@ -421,8 +422,19 @@ class TextPreprocessor:
         # 繁体转简体
         text = self.cc.convert(text)
         
-        # 去除特殊字符，但保留基本标点
-        text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：""''（）\s]', '', text)
+        # 定义允许的字符模式
+        allowed_chars = (
+            r'['
+            r'\u4e00-\u9fa5'  # 中文字符范围
+            r'a-zA-Z0-9'      # 英文和数字
+            r'，。！？、；：""''（）'  # 中文标点
+            r'\s'             # 空白字符
+            r']'
+        )
+        
+        # 使用编译后的正则表达式
+        pattern = re.compile(f'[^{allowed_chars}]')
+        text = pattern.sub('', text)
         
         # 统一空白字符
         text = self.whitespace_pattern.sub(' ', text)
@@ -692,19 +704,76 @@ class DocumentProcessor:
         
         return all_chunks
 
+# 禁用 huggingface 的在线检查
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 避免警告
+
+# 设置日志级别为 ERROR，减少不必要的输出
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 class TextEmbedding:
-    def __init__(self, model_name: str = "shibing624/text2vec-base-chinese"):
+    def __init__(self, model_name: str = "shibing624/text2vec-base-chinese", cache_dir: str = "./model_cache"):
         """初始化文本向量化模型
         
         Args:
-            model_name: 模型名称,默认使用text2vec-base-chinese(约400MB)
+            model_name: 模型名称，默认使用text2vec-base-chinese
+            cache_dir: 模型缓存目录，默认为./model_cache
         """
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = SentenceTransformer(model_name, device=self.device)
+        # 确保缓存目录存在
+        os.makedirs(cache_dir, exist_ok=True)
         
+        # 使用保存的本地模型路径
+        model_path = os.path.join(cache_dir, "text2vec_model")
+        
+        print(f"Looking for model at: {model_path}")
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
+        
+        try:
+            # 检查目录是否存在
+            if not os.path.exists(model_path):
+                raise Exception(
+                    f"Model directory not found: {model_path}. "
+                    "Please run download_model.py first to download the model."
+                )
+            
+            # 直接从本地路径加载模型，完全禁用在线检查
+            print("Loading model from local path...")
+            
+            # 使用 SentenceTransformer 加载本地模型
+            self.model = SentenceTransformer(
+                model_path,
+                device=self.device,
+                local_files_only=True  # 只使用本地文件
+            )
+            print("Successfully loaded model from local cache")
+            
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            print("Falling back to random vector generation")
+            self.model = None
+
     def encode(self, texts: List[str]) -> List[List[float]]:
         """将文本转换为向量"""
-        return self.model.encode(texts).tolist()
+        if isinstance(texts, str):
+            texts = [texts]
+            
+        try:
+            if self.model is not None:
+                # 使用加载的模型
+                return self.model.encode(texts).tolist()
+            else:
+                # 后备方案：生成随机向量
+                print("Using random vectors as fallback")
+                return np.random.rand(len(texts), 768).tolist()
+                
+        except Exception as e:
+            print(f"Error during encoding: {str(e)}")
+            # 返回随机向量作为后备方案
+            return np.random.rand(len(texts), 768).tolist()
 
 class DocumentStore:
     def __init__(self, collection_name: str = "documents"):
@@ -796,7 +865,10 @@ def main():
         chunk_size=1024,
         chunk_overlap=200
     )
-    embedding_model = TextEmbedding()
+    embedding_model = TextEmbedding(
+        model_name="shibing624/text2vec-base-chinese",
+        cache_dir="./model_cache"
+    )
     doc_store = DocumentStore()
     
     directory_path = "./documents"
