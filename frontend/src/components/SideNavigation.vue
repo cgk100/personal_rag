@@ -13,15 +13,20 @@
         :collapse="isCollapsed"
         @select="handleMenuSelect"
       >
+
+
+      <el-menu-item index="chat">
+        <el-icon><ChatDotRound /></el-icon>
+        <template #title>Ai对话</template>
+      </el-menu-item>
+
+      
         <el-menu-item index="knowledge">
           <el-icon><Document /></el-icon>
           <template #title>知识库管理</template>
         </el-menu-item>
 
-        <el-menu-item index="chat">
-          <el-icon><ChatDotRound /></el-icon>
-          <template #title>Ai对话</template>
-        </el-menu-item>
+  
         
         <el-menu-item index="settings">
           <el-icon><Setting /></el-icon>

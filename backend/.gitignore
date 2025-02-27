@@ -4,3 +4,4 @@ logs
 model_cache
 app.log
 vector_db
+__pycache__
