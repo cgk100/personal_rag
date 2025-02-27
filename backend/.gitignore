@@ -1,0 +1,6 @@
+chroma_db
+documents
+logs
+model_cache
+app.log
+vector_db
