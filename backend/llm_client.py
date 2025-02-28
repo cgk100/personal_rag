@@ -120,20 +120,55 @@ class LLMClient:
             流式聊天完成响应的生成器
         """
         try:
+            # 记录请求信息
+            logger.info(f"开始流式聊天请求，消息数量: {len(messages)}")
+            
+            # 记录最后几条消息以便调试
+            if messages:
+                last_messages = messages[-min(3, len(messages)):]
+                for i, msg in enumerate(last_messages):
+                    logger.info(f"最近消息 {i+1}: 角色={msg.get('role', 'unknown')}, 内容={msg.get('content', '')[:100]}...")
+            
+            # 确保消息格式正确
+            formatted_messages = []
+            for msg in messages:
+                if 'role' in msg and 'content' in msg:
+                    formatted_messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
+                else:
+                    logger.warning(f"跳过格式不正确的消息: {msg}")
+            
+            if not formatted_messages:
+                logger.error("没有有效的消息可发送")
+                yield "错误: 没有有效的消息"
+                return
+            
+            # 创建流式响应
+            logger.info(f"向模型 {self.model} 发送请求，温度={temperature}, 最大令牌数={max_tokens}")
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=messages,
+                messages=formatted_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=True
             )
             
+            # 流式输出内容
+            content_buffer = ""
             for chunk in response:
                 if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                    content = chunk.choices[0].delta.content
+                    content_buffer += content
+                    yield content
+            
+            logger.info(f"流式响应完成，总生成内容长度: {len(content_buffer)}")
+            
         except Exception as e:
-            logger.error(f"流式聊天完成请求失败: {str(e)}")
-            raise
+            error_msg = f"流式聊天完成请求失败: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            yield f"处理请求时出错: {str(e)}"
             
     def stream_chat_completion_with_knowledge(self, 
                                              messages: List[Dict[str, str]], 
@@ -185,17 +220,17 @@ class LLMClient:
                 # 构建上下文和源信息
                 for i, (doc, meta) in enumerate(zip(docs, metadatas)):
                     # 添加文档到上下文
-                    context += f"\n文档 {i+1} (来源: {meta.get('source', '未知')}):\n{doc}\n"
+                    source_path = meta.get('source', '未知')
+                    context += f"\n文档 {i+1} (来源: {source_path}):\n{doc}\n"
                     
                     # 提取文件名
-                    source_path = meta.get('source', '')
-                    if source_path:
+                    if source_path and source_path != '未知':
                         # 从路径中提取文件名
                         filename = os.path.basename(source_path)
                         
                         # 如果文件名格式为 uuid_原始文件名，则提取原始文件名
-                        if '_' in filename and len(filename.split('_')[0]) == 36:
-                            # UUID长度为36个字符
+                        if '_' in filename and len(filename.split('_')[0]) >= 32:
+                            # UUID通常至少32个字符
                             original_filename = '_'.join(filename.split('_')[1:])
                         else:
                             original_filename = filename
@@ -203,6 +238,14 @@ class LLMClient:
                         # 添加到源数据
                         sources_data.append({
                             "filename": original_filename,
+                            "title": f"文档 {i+1}",
+                            "content": doc[:200] + "..." if len(doc) > 200 else doc,
+                            "source_path": source_path  # 添加完整路径以便调试
+                        })
+                    else:
+                        # 处理未知来源
+                        sources_data.append({
+                            "filename": "未知文件",
                             "title": f"文档 {i+1}",
                             "content": doc[:200] + "..." if len(doc) > 200 else doc
                         })
@@ -241,6 +284,7 @@ class LLMClient:
             
             # 流式输出内容
             content_buffer = ""
+            
             for chunk in response:
                 if chunk.choices and chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
@@ -249,6 +293,9 @@ class LLMClient:
             
             # 在内容后附加知识库来源信息
             if sources_data:
+                # 记录源数据以便调试
+                logger.info(f"源数据详情: {json.dumps(sources_data, ensure_ascii=False)}")
+                
                 # 格式化知识库来源
                 sources_json = json.dumps(sources_data, ensure_ascii=False)
                 logger.info(f"输出知识库来源信息: {sources_json}")
@@ -342,13 +389,32 @@ class LLMClient:
             
             # 提取文件名作为来源
             sources = []
-            for meta in unique_metas:
-                source = meta.get('source', '')
-                if source:
+            source_details = []
+            
+            for i, meta in enumerate(unique_metas):
+                source_path = meta.get('source', '')
+                if source_path:
                     # 从路径中提取文件名
-                    filename = os.path.basename(source)
-                    if filename not in sources:
-                        sources.append(filename)
+                    filename = os.path.basename(source_path)
+                    
+                    # 如果文件名格式为 uuid_原始文件名，则提取原始文件名
+                    if '_' in filename and len(filename.split('_')[0]) >= 32:
+                        original_filename = '_'.join(filename.split('_')[1:])
+                    else:
+                        original_filename = filename
+                    
+                    if original_filename not in sources:
+                        sources.append(original_filename)
+                        
+                    # 添加详细信息用于调试
+                    source_details.append({
+                        "index": i+1,
+                        "original_path": source_path,
+                        "extracted_filename": original_filename
+                    })
+            
+            # 记录源文件详情以便调试
+            logger.info(f"源文件详情: {json.dumps(source_details, ensure_ascii=False)}")
             
             # 添加来源信息到提示词
             source_info = "参考文件: " + ", ".join(sources)
@@ -377,7 +443,9 @@ class LLMClient:
             )
             
             # 首先输出来源信息
-            yield f"(来源: {', '.join(sources)})\n\n"
+            sources_str = ", ".join(sources)
+            logger.info(f"使用的来源文件: {sources_str}")
+            yield f"(来源: {sources_str})\n\n"
             
             # 返回流式响应
             for chunk in response:

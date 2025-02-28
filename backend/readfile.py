@@ -121,13 +121,313 @@ class FileProcessor:
         """读取DOC文件"""
         try:
             self.logger.info(f"开始读取DOC文件: {file_path}")
-            documents = self.unstructured_reader.load_data(file_path)
-            self.logger.info(f"成功读取DOC文件")
-            return documents
+            
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                self.logger.error(f"DOC文件不存在: {file_path}")
+                raise FileNotFoundError(f"文件不存在: {file_path}")
+            
+            # 检查文件大小
+            file_size = os.path.getsize(file_path)
+            self.logger.info(f"DOC文件大小: {file_size} 字节")
+            
+            # 检查文件权限
+            self.logger.info(f"检查文件权限...")
+            try:
+                with open(file_path, 'rb') as f:
+                    # 只读取前几个字节，检查文件是否可读
+                    f.read(10)
+                self.logger.info(f"文件权限正常，可以读取")
+            except Exception as e:
+                self.logger.error(f"文件权限检查失败: {str(e)}")
+                raise
+            
+            # 尝试使用olefile直接读取DOC文件
+            try:
+                import olefile
+                self.logger.info("尝试使用olefile读取DOC文件...")
+                
+                if olefile.isOleFile(file_path):
+                    self.logger.info("文件是有效的OLE文件")
+                    
+                    try:
+                        ole = olefile.OleFileIO(file_path)
+                        self.logger.info(f"OLE文件已打开，可用流: {ole.listdir()}")
+                        
+                        # 尝试读取WordDocument流
+                        if ole.exists('WordDocument'):
+                            self.logger.info("找到WordDocument流")
+                            
+                            # 尝试提取文本
+                            text_parts = []
+                            
+                            # 尝试读取主要文本流
+                            try:
+                                word_stream = ole.openstream('WordDocument')
+                                word_data = word_stream.read()
+                                self.logger.info(f"读取到WordDocument流，大小: {len(word_data)} 字节")
+                                
+                                # 尝试从二进制数据中提取ASCII文本
+                                text = ''.join(chr(b) for b in word_data if 32 <= b <= 126 or b in [10, 13])
+                                if len(text) > 100:  # 至少有100个字符
+                                    text_parts.append(text)
+                                    self.logger.info(f"从WordDocument流提取了 {len(text)} 个字符")
+                            except Exception as e:
+                                self.logger.warning(f"读取WordDocument流时出错: {str(e)}")
+                            
+                            # 尝试读取其他可能包含文本的流
+                            for stream_name in ole.listdir():
+                                if 'Text' in str(stream_name) or 'Contents' in str(stream_name):
+                                    try:
+                                        stream = ole.openstream(stream_name)
+                                        data = stream.read()
+                                        text = ''.join(chr(b) for b in data if 32 <= b <= 126 or b in [10, 13])
+                                        if len(text) > 50:  # 至少有50个字符
+                                            text_parts.append(text)
+                                            self.logger.info(f"从流 {stream_name} 提取了 {len(text)} 个字符")
+                                    except Exception as e:
+                                        self.logger.warning(f"读取流 {stream_name} 时出错: {str(e)}")
+                            
+                            # 如果成功提取了文本
+                            if text_parts:
+                                combined_text = '\n\n'.join(text_parts)
+                                self.logger.info(f"成功从DOC文件中提取了 {len(combined_text)} 个字符")
+                                document = Document(text=combined_text, metadata={
+                                    'file_path': file_path,
+                                    'extraction_method': 'olefile'
+                                })
+                                ole.close()  # 确保关闭文件
+                                return [document]
+                        else:
+                            self.logger.warning("未找到WordDocument流")
+                        
+                        ole.close()  # 确保关闭文件
+                    except Exception as ole_error:
+                        self.logger.warning(f"使用olefile处理时出错: {str(ole_error)}")
+                else:
+                    self.logger.warning("文件不是有效的OLE文件")
+            except ImportError:
+                self.logger.warning("olefile库未安装，跳过此方法")
+            
+            # 尝试使用python-docx2txt读取
+            try:
+                import docx2txt
+                self.logger.info(f"使用docx2txt尝试读取...")
+                try:
+                    # 尝试将DOC文件转换为DOCX
+                    self.logger.info("尝试将DOC转换为DOCX后再处理...")
+                    
+                    # 创建临时DOCX文件
+                    import tempfile
+                    import shutil
+                    
+                    temp_docx = tempfile.NamedTemporaryFile(suffix='.docx', delete=False).name
+                    self.logger.info(f"创建临时DOCX文件: {temp_docx}")
+                    
+                    # 尝试复制并重命名为DOCX
+                    shutil.copy2(file_path, temp_docx)
+                    self.logger.info(f"已复制文件到临时DOCX")
+                    
+                    # 尝试使用docx2txt处理
+                    try:
+                        text = docx2txt.process(temp_docx)
+                        self.logger.info(f"使用docx2txt成功读取临时DOCX，文本长度: {len(text)}")
+                        document = Document(text=text, metadata={'file_path': file_path})
+                        
+                        # 删除临时文件
+                        try:
+                            os.unlink(temp_docx)
+                        except Exception as del_error:
+                            self.logger.warning(f"删除临时文件失败: {str(del_error)}")
+                        
+                        return [document]
+                    except Exception as temp_error:
+                        self.logger.warning(f"处理临时DOCX失败: {str(temp_error)}")
+                        # 删除临时文件
+                        try:
+                            os.unlink(temp_docx)
+                        except Exception as del_error:
+                            self.logger.warning(f"删除临时文件失败: {str(del_error)}")
+                    
+                    # 直接尝试处理原始DOC文件
+                    try:
+                        text = docx2txt.process(file_path)
+                        self.logger.info(f"使用docx2txt成功读取原始DOC，文本长度: {len(text)}")
+                        document = Document(text=text, metadata={'file_path': file_path})
+                        return [document]
+                    except Exception as docx2txt_error:
+                        self.logger.warning(f"docx2txt读取失败: {str(docx2txt_error)}")
+                        # 继续尝试其他方法
+                except Exception as docx2txt_error:
+                    self.logger.warning(f"docx2txt读取失败: {str(docx2txt_error)}")
+                    # 继续尝试其他方法
+            except ImportError:
+                self.logger.warning("docx2txt库未安装，跳过此方法")
+            
+            # 尝试使用textract
+            try:
+                import textract
+                self.logger.info(f"使用textract尝试读取...")
+                try:
+                    text = textract.process(file_path).decode('utf-8', errors='ignore')
+                    self.logger.info(f"使用textract成功读取，文本长度: {len(text)}")
+                    document = Document(text=text, metadata={'file_path': file_path})
+                    return [document]
+                except Exception as textract_error:
+                    self.logger.warning(f"textract读取失败: {str(textract_error)}")
+                    # 继续尝试其他方法
+            except ImportError:
+                self.logger.warning("textract库未安装，跳过此方法")
+            
+            # 尝试使用antiword (如果安装了)
+            try:
+                import subprocess
+                self.logger.info(f"尝试使用antiword读取...")
+                try:
+                    # 修复编码问题 - 使用二进制模式并手动处理编码
+                    result = subprocess.run(
+                        ['antiword', file_path], 
+                        capture_output=True, 
+                        text=False,  # 使用二进制模式
+                        check=False  # 不要在失败时抛出异常
+                    )
+                    
+                    # 检查命令是否成功执行
+                    if result.returncode == 0 and result.stdout:
+                        # 尝试多种编码解码输出
+                        for encoding in ['utf-8', 'latin-1', 'cp1252', 'ascii']:
+                            try:
+                                text = result.stdout.decode(encoding, errors='ignore')
+                                if len(text.strip()) > 0:
+                                    self.logger.info(f"使用antiword成功读取，文本长度: {len(text)}，编码: {encoding}")
+                                    document = Document(text=text, metadata={
+                                        'file_path': file_path,
+                                        'extraction_method': 'antiword',
+                                        'encoding': encoding
+                                    })
+                                    return [document]
+                            except Exception as decode_error:
+                                self.logger.warning(f"使用{encoding}解码antiword输出失败: {str(decode_error)}")
+                    else:
+                        self.logger.warning(f"antiword命令执行失败，返回码: {result.returncode}")
+                        if result.stderr:
+                            stderr_text = result.stderr.decode('utf-8', errors='ignore')
+                            self.logger.warning(f"antiword错误输出: {stderr_text}")
+                except Exception as antiword_error:
+                    self.logger.warning(f"antiword读取失败: {str(antiword_error)}")
+                    # 继续尝试其他方法
+            except (ImportError, FileNotFoundError):
+                self.logger.warning("antiword未安装或不可用，跳过此方法")
+            
+            # 最后尝试使用unstructured_reader，使用线程超时而不是信号
+            self.logger.info(f"开始使用UnstructuredReader读取DOC文件...")
+            self.logger.info(f"UnstructuredReader配置: {vars(self.unstructured_reader)}")
+            
+            # 使用线程和事件来实现超时
+            import threading
+            import time
+            
+            result = []
+            exception = []
+            
+            def read_doc_with_timeout():
+                try:
+                    docs = self.unstructured_reader.load_data(file_path)
+                    result.extend(docs)
+                except Exception as e:
+                    exception.append(e)
+                    self.logger.error(f"UnstructuredReader读取失败: {str(e)}")
+            
+            # 创建线程
+            thread = threading.Thread(target=read_doc_with_timeout)
+            thread.daemon = True  # 设置为守护线程，这样主程序退出时它也会退出
+            
+            # 开始线程
+            self.logger.info("启动UnstructuredReader读取线程...")
+            thread.start()
+            
+            # 等待线程完成，最多等待60秒
+            timeout = 60  # 60秒超时
+            start_time = time.time()
+            
+            while thread.is_alive() and (time.time() - start_time) < timeout:
+                time.sleep(0.5)  # 每0.5秒检查一次
+                
+            # 检查是否超时
+            if thread.is_alive():
+                self.logger.error(f"读取DOC文件超时 ({timeout}秒)")
+                
+                # 尝试使用二进制方法读取
+                self.logger.info("尝试使用二进制方法读取文件内容...")
+                try:
+                    with open(file_path, 'rb') as f:
+                        binary_content = f.read()
+                    # 尝试提取可读文本
+                    text_content = ''.join(chr(b) for b in binary_content if 32 <= b <= 126 or b in [10, 13])
+                    self.logger.info(f"提取到的文本长度: {len(text_content)}")
+                    document = Document(text=text_content, metadata={'file_path': file_path, 'extraction_method': 'binary'})
+                    return [document]
+                except Exception as binary_error:
+                    self.logger.error(f"二进制读取失败: {str(binary_error)}")
+                    raise Exception(f"读取DOC文件超时，且二进制读取失败: {str(binary_error)}")
+            
+            # 检查是否有异常
+            if exception:
+                raise exception[0]
+            
+            # 检查是否有结果
+            if result:
+                self.logger.info(f"成功读取DOC文件，文档数: {len(result)}")
+                return result
+            else:
+                # 如果没有结果也没有异常，尝试二进制读取
+                self.logger.warning("UnstructuredReader没有返回任何文档，尝试二进制读取...")
+                with open(file_path, 'rb') as f:
+                    binary_content = f.read()
+                # 尝试提取可读文本
+                text_content = ''.join(chr(b) for b in binary_content if 32 <= b <= 126 or b in [10, 13])
+                self.logger.info(f"提取到的文本长度: {len(text_content)}")
+                document = Document(text=text_content, metadata={'file_path': file_path, 'extraction_method': 'binary'})
+                return [document]
             
         except Exception as e:
             self.logger.error(f"读取DOC文件 {file_path} 时出错: {str(e)}")
-            raise
+            self.logger.error(f"错误详情: {traceback.format_exc()}")
+            
+            # 尝试使用最简单的方法提取一些文本，避免完全失败
+            try:
+                self.logger.info("尝试最后的应急方法提取文本...")
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                # 尝试不同的编码
+                for encoding in ['utf-8', 'latin-1', 'cp1252', 'ascii']:
+                    try:
+                        text = content.decode(encoding, errors='ignore')
+                        # 只保留可打印字符
+                        text = ''.join(char for char in text if char.isprintable() or char in ['\n', '\r', '\t'])
+                        if len(text.strip()) > 100:  # 至少有100个有意义的字符
+                            self.logger.info(f"使用{encoding}编码成功提取了{len(text)}个字符")
+                            document = Document(text=text, metadata={
+                                'file_path': file_path, 
+                                'extraction_method': 'emergency',
+                                'encoding': encoding
+                            })
+                            return [document]
+                    except Exception:
+                        continue
+                
+                # 如果所有尝试都失败，返回一个带有错误信息的文档
+                error_text = f"无法读取文件内容。错误: {str(e)}"
+                document = Document(text=error_text, metadata={
+                    'file_path': file_path,
+                    'extraction_failed': True,
+                    'error': str(e)
+                })
+                return [document]
+            
+            except Exception as final_error:
+                self.logger.error(f"所有读取方法都失败: {str(final_error)}")
+                raise
             
     def _read_docx(self, file_path: str) -> List[Document]:
         """读取DOCX文件"""
@@ -463,38 +763,6 @@ class FileProcessor:
         # 如果文本长度小于块大小，直接返回
         if len(text) <= chunk_size:
             return [text]
-        
-        chunks = []
-        start = 0
-        
-        while start < len(text):
-            # 计算当前块的结束位置
-            end = start + chunk_size
-            
-            # 如果不是最后一个块，尝试在句子或段落边界分割
-            if end < len(text):
-                # 尝试在段落边界分割
-                paragraph_end = text.rfind('\n\n', start, end)
-                if paragraph_end > start + chunk_size // 2:
-                    end = paragraph_end + 2  # 包含段落分隔符
-                else:
-                    # 尝试在句子边界分割
-                    sentence_end = text.rfind('. ', start, end)
-                    if sentence_end > start + chunk_size // 2:
-                        end = sentence_end + 2  # 包含句号和空格
-            
-            # 添加当前块
-            chunks.append(text[start:end])
-            
-            # 更新下一个块的起始位置，考虑重叠
-            start = end - chunk_overlap
-            
-            # 确保起始位置不会后退
-            if start <= 0:
-                start = end
-                break
-        
-        return chunks
 
 class TextPreprocessor:
     """文本预处理类"""

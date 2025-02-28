@@ -1,6 +1,6 @@
 <template>
   <div id="app">
-    <KnowledgeBaseApp />
+    <KnowledgeBaseApp :default-active="'chat'" />
   </div>
 </template>
 
@@ -27,10 +27,14 @@ export default {
   /* 中性色 */
   --color-white: #FFFFFF;
   --color-background: #F5F7FA;
+  --color-background-light: #F8F9FB;
   --color-text-primary: #303133;
   --color-text-regular: #606266;
   --color-text-secondary: #909399;
   --color-border: #DCDFE6;
+  
+  /* 主题色变体 */
+  --color-primary-light: #ECF5FF;
   
   /* 间距 */
   --spacing-base: 8px;

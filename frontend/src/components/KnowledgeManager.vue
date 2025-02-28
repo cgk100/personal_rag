@@ -200,7 +200,7 @@
         drag
         multiple
         :auto-upload="false"
-        :limit="10"
+        :limit="200"
         v-model:file-list="fileList"
         :accept="acceptedFileTypes"
         :on-change="handleFileChange"
@@ -259,11 +259,15 @@ export default {
     const fileList = ref([]);
     const uploadLoading = ref(false);
     const apiError = ref(null);
+    // eslint-disable-next-line no-unused-vars
     const showDebug = ref(false); // 控制是否显示调试信息
     
     // 定义接受的文件类型
     const acceptedFileTypes = '.pdf,.doc,.docx,.csv,.xlsx,.xls,.epub,.md,.txt';
     const allowedFileExtensions = ['pdf', 'doc', 'docx', 'csv', 'xlsx', 'xls', 'epub', 'md', 'txt'];
+    
+    // 定义文件大小限制（50MB）
+    const maxFileSize = 50 * 1024 * 1024;
     
     // 添加调试日志
     console.log('KnowledgeManager组件初始化');
@@ -317,13 +321,32 @@ export default {
     
     // 处理文件变更，验证文件类型
     const handleFileChange = (file, fileList) => {
+      console.log('文件变更:', file.name, file.type, '大小:', formatFileSize(file.size));
+      
+      // 获取文件扩展名（不区分大小写）
       const extension = file.name.split('.').pop().toLowerCase();
       
+      console.log('文件扩展名:', extension, '文件MIME类型:', file.type);
+      
+      // 检查文件大小
+      if (file.size > maxFileSize) {
+        ElMessage.error(`文件 "${file.name}" 太大，不能超过 50MB`);
+        
+        // 从文件列表中移除过大的文件
+        const index = fileList.findIndex(f => f.uid === file.uid);
+        if (index !== -1) {
+          fileList.splice(index, 1);
+        }
+        
+        return false;
+      }
+      
+      // 检查文件类型
       if (!allowedFileExtensions.includes(extension)) {
         ElMessage.error(`不支持的文件类型: ${extension}，请上传 ${allowedFileExtensions.join(', ')} 格式的文件`);
         
         // 从文件列表中移除不支持的文件
-        const index = fileList.indexOf(file);
+        const index = fileList.findIndex(f => f.uid === file.uid);
         if (index !== -1) {
           fileList.splice(index, 1);
         }
@@ -334,51 +357,37 @@ export default {
       return true;
     };
     
-    // 上传文件
-    const handleUpload = async () => {
-      if (fileList.value.length === 0) {
-        ElMessage.warning('请先选择要上传的文件');
-        return;
+    // 上传单个文件的函数
+    const uploadSingleFile = async (file, index, totalFiles, loadingMessage) => {
+      if (!file.raw) {
+        console.warn(`文件 ${file.name} 没有raw属性，无法上传`);
+        return { success: false, error: '文件格式错误' };
       }
       
-      // 验证文件类型
-      const invalidFiles = fileList.value.filter(file => {
-        const extension = file.name.split('.').pop().toLowerCase();
-        return !allowedFileExtensions.includes(extension);
-      });
+      // 更新上传进度提示
+      loadingMessage.message = `正在上传文件 (${index+1}/${totalFiles}): ${file.name}`;
       
-      if (invalidFiles.length > 0) {
-        const invalidFileNames = invalidFiles.map(f => f.name).join(', ');
-        ElMessage.error(`不支持的文件类型: ${invalidFileNames}`);
-        return;
+      // 创建FormData对象
+      const formData = new FormData();
+      
+      // 获取文件扩展名
+      const extension = file.name.split('.').pop().toLowerCase();
+      
+      // 对于DOC文件，添加特殊处理
+      if (extension === 'doc') {
+        console.log('正在上传DOC文件，添加特殊处理');
+        // 可以添加一个标志告诉后端这是DOC文件
+        formData.append('file_type', 'doc');
+        
+        // 添加警告提示
+        ElMessage.warning('DOC格式文件处理可能需要较长时间，请耐心等待');
       }
+      
+      formData.append('file', file.raw);
+      
+      console.log(`开始上传文件 ${index+1}/${totalFiles}: ${file.name}, 类型: ${file.raw.type}, 大小: ${formatFileSize(file.raw.size)}`);
       
       try {
-        uploadLoading.value = true;
-        apiError.value = null;
-        
-        // 创建FormData对象
-        const formData = new FormData();
-        
-        // 检查后端API是否期望单个文件或多个文件
-        if (fileList.value.length === 1) {
-          // 单个文件上传
-          formData.append('file', fileList.value[0].raw);
-        } else {
-          // 多个文件上传 - 尝试两种可能的字段名
-          fileList.value.forEach(file => {
-            formData.append('files', file.raw);
-          });
-        }
-        
-        // 打印FormData内容以便调试
-        console.log('FormData内容:');
-        for (let [key, value] of formData.entries()) {
-          console.log(`${key}: ${value instanceof File ? value.name : value}`);
-        }
-        
-        console.log('开始上传文件:', fileList.value.length, '个文件');
-        
         // 发送上传请求
         const response = await axios.post(
           `${API_CONFIG.baseURL}${API_CONFIG.paths.upload}`, 
@@ -390,68 +399,146 @@ export default {
             // 添加上传进度处理
             onUploadProgress: (progressEvent) => {
               const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-              console.log(`上传进度: ${percentCompleted}%`);
-            }
+              console.log(`文件 ${file.name} 上传进度: ${percentCompleted}%`);
+            },
+            timeout: 120000 // 增加到120秒超时
           }
         );
         
-        console.log('上传响应:', response);
+        console.log(`文件 ${file.name} 上传响应:`, response);
         
         if (response.status === 200 || response.status === 201) {
-          // 关闭对话框
-          uploadDialogVisible.value = false;
+          console.log(`文件 ${file.name} 上传成功`);
           
-          // 清空文件列表
-          fileList.value = [];
+          // 对于DOC文件，添加额外提示
+          if (extension === 'doc') {
+            ElMessage.info(`DOC文件 ${file.name} 已上传，后台处理可能需要较长时间`);
+          }
           
-          // 显示上传成功消息，但提示用户文件正在处理中
-          ElMessage({
-            type: 'success',
-            message: '文件已上传成功，正在后台处理中，请稍后刷新查看',
-            duration: 5000
-          });
-          
-          // 设置一个定时器，延迟刷新文件列表
-          setTimeout(() => {
-            fetchKnowledgeFiles();
-          }, 3000); // 3秒后刷新一次
-          
-          // 再设置一个定时器，再次刷新文件列表
-          setTimeout(() => {
-            fetchKnowledgeFiles();
-            ElMessage.info('文件处理可能需要一些时间，如未看到新文件，请手动刷新');
-          }, 10000); // 10秒后再次刷新
+          return { success: true };
         } else {
-          ElMessage.error('上传文件失败: ' + (response.data?.detail || '未知错误'));
+          console.error(`文件 ${file.name} 上传失败:`, response.data);
+          return { 
+            success: false, 
+            error: response.data?.detail || response.data?.message || '上传失败'
+          };
         }
       } catch (error) {
-        console.error('上传文件失败:', error);
+        console.error(`文件 ${file.name} 上传失败:`, error);
         
-        let errorMessage = '上传文件失败';
+        // 记录错误详情
+        let errorDetail = '未知错误';
+        if (error.response && error.response.data) {
+          console.error(`文件 ${file.name} 错误详情:`, error.response.data);
+          errorDetail = error.response.data?.detail || 
+                       error.response.data?.message || 
+                       JSON.stringify(error.response.data);
+        } else if (error.message) {
+          errorDetail = error.message;
+        }
         
-        if (error.response) {
-          console.error('错误响应:', error.response);
+        // 对于DOC文件，添加更具体的错误提示
+        if (extension === 'doc') {
+          errorDetail = 'DOC格式文件处理失败，请尝试转换为DOCX格式后再上传: ' + errorDetail;
+        }
+        
+        return { success: false, error: errorDetail };
+      }
+    };
+    
+    // 上传文件 - 修改为逐个上传文件
+    const handleUpload = async () => {
+      if (fileList.value.length === 0) {
+        ElMessage.warning('请先选择要上传的文件');
+        return;
+      }
+      
+      try {
+        uploadLoading.value = true;
+        apiError.value = null;
+        
+        // 记录成功上传的文件数量
+        let successCount = 0;
+        let failCount = 0;
+        const totalFiles = fileList.value.length;
+        const failedFiles = [];
+        
+        // 显示上传进度提示
+        const loadingMessage = ElMessage({
+          type: 'info',
+          message: `正在上传文件 (0/${totalFiles})`,
+          duration: 0 // 不自动关闭
+        });
+        
+        // 逐个上传文件
+        for (let i = 0; i < fileList.value.length; i++) {
+          const file = fileList.value[i];
           
-          if (error.response.data) {
-            if (typeof error.response.data === 'object') {
-              if (error.response.data.detail) {
-                errorMessage += ': ' + error.response.data.detail;
-              } else if (error.response.data.message) {
-                errorMessage += ': ' + error.response.data.message;
-              } else {
-                // 打印完整的错误响应数据
-                errorMessage += ': ' + JSON.stringify(error.response.data);
-              }
-            } else if (typeof error.response.data === 'string') {
-              errorMessage += ': ' + error.response.data;
-            }
-          } else if (error.message) {
-            errorMessage += ': ' + error.message;
+          // 更新上传进度消息 - 修复：在这里更新消息，而不是在uploadSingleFile内部
+          loadingMessage.message = `正在上传文件 (${i+1}/${totalFiles}): ${file.name}`;
+          
+          const result = await uploadSingleFile(file, i, totalFiles, loadingMessage);
+          
+          if (result.success) {
+            successCount++;
+          } else {
+            failCount++;
+            failedFiles.push({ name: file.name, error: result.error });
           }
         }
         
-        apiError.value = errorMessage;
-        ElMessage.error(errorMessage);
+        // 关闭上传进度提示
+        loadingMessage.close();
+        
+        // 关闭对话框
+        uploadDialogVisible.value = false;
+        
+        // 显示上传结果
+        if (successCount > 0) {
+          ElMessage({
+            type: successCount === totalFiles ? 'success' : 'warning',
+            message: `成功上传 ${successCount}/${totalFiles} 个文件，${failCount > 0 ? `${failCount} 个文件上传失败，` : ''}正在后台处理中，请稍后刷新查看`,
+            duration: 5000
+          });
+          
+          // 如果有失败的文件，显示详细信息
+          if (failedFiles.length > 0) {
+            console.error('上传失败的文件:', failedFiles);
+            setTimeout(() => {
+              ElMessage.error(`上传失败的文件: ${failedFiles.map(f => f.name).join(', ')}`);
+            }, 1000);
+          }
+        } else {
+          ElMessage.error('所有文件上传失败，请检查文件格式或网络连接');
+          
+          // 显示详细的错误信息
+          if (failedFiles.length > 0) {
+            console.error('上传失败的文件详情:', failedFiles);
+            setTimeout(() => {
+              ElMessage.error(`上传失败原因: ${failedFiles[0].error}`);
+            }, 1000);
+          }
+        }
+        
+        // 清空文件列表
+        fileList.value = [];
+        
+        // 设置一个定时器，延迟刷新文件列表
+        setTimeout(() => {
+          fetchKnowledgeFiles();
+        }, 3000); // 3秒后刷新一次
+        
+        // 再设置一个定时器，再次刷新文件列表
+        setTimeout(() => {
+          fetchKnowledgeFiles();
+          if (successCount > 0) {
+            ElMessage.info('文件处理可能需要一些时间，如未看到新文件，请手动刷新');
+          }
+        }, 10000); // 10秒后再次刷新
+      } catch (error) {
+        console.error('上传过程中发生错误:', error);
+        apiError.value = '上传过程中发生错误: ' + (error.message || '未知错误');
+        ElMessage.error(apiError.value);
       } finally {
         uploadLoading.value = false;
       }
@@ -561,7 +648,8 @@ export default {
       UploadFilled,
       acceptedFileTypes,
       handleFileChange,
-      showDebug
+      showDebug,
+      maxFileSize
     };
   }
 };
