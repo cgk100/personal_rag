@@ -511,17 +511,57 @@ async def delete_file(file_id: str):
             logger.warning(f"文件不存在: {file_id}")
             raise HTTPException(status_code=404, detail="文件不存在")
         
-        # 删除物理文件
+        # 1. 从向量数据库中删除文档
+        try:
+            doc_store = DocumentStore()
+            file_path = file_record["path"]
+            logger.info(f"从向量数据库中删除文档: {file_path}")
+            
+            # 调用删除方法
+            delete_result = doc_store.delete_document(file_path)
+            if delete_result:
+                logger.info(f"成功从向量数据库中删除文档: {file_path}")
+            else:
+                logger.warning(f"从向量数据库中删除文档失败: {file_path}")
+                
+            # 验证删除结果
+            doc_count = doc_store.count_documents_by_file_id(file_id)
+            logger.info(f"删除后文档数量检查: {doc_count}")
+            
+        except Exception as e:
+            logger.error(f"从向量数据库删除文档时出错: {str(e)}")
+            logger.error(f"错误详情: {traceback.format_exc()}")
+            # 继续执行文件删除，即使向量数据库删除失败
+        
+        # 2. 删除物理文件
         file_path = file_record["path"]
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info(f"已删除物理文件: {file_path}")
+        else:
+            logger.warning(f"物理文件不存在: {file_path}")
         
-        # 从列表中移除文件记录
+        # 3. 从列表中移除文件记录
         knowledge_files.remove(file_record)
         logger.info(f"已从知识库中移除文件记录: {file_id}")
         
-        return {"success": True}
+        # 4. 打印最终状态
+        try:
+            remaining_files = [f["id"] for f in knowledge_files]
+            logger.info(f"剩余文件: {remaining_files}")
+            
+            # 检查向量数据库状态
+            stats = doc_store.get_collection_stats()
+            logger.info(f"向量数据库统计: {json.dumps(stats, ensure_ascii=False)}")
+            
+        except Exception as e:
+            logger.error(f"获取状态信息时出错: {str(e)}")
+        
+        return {
+            "success": True,
+            "message": "文件已成功删除",
+            "file_id": file_id
+        }
         
     except HTTPException:
         raise

@@ -31,6 +31,9 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import jieba.analyse
 from torch import nn
+import time
+import json
+import sqlite3
 
 class FileProcessor:
     def __init__(self, log_dir: str = "logs"):
@@ -1047,23 +1050,120 @@ class DocumentProcessor:
     def process_documents(self, documents: List[Document]) -> List[Tuple[str, Dict]]:
         """处理文档列表"""
         all_chunks = []
+        current_time = int(time.time())
         
-        for doc in documents:
-            # 1. 智能分块
-            chunks = self.chunker.create_chunks(doc.text)
+        try:
+            # 连接到 ChromaDB 的 SQLite 数据库
+            db_path = os.path.join('./chroma_db', 'chroma.sqlite3')
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
             
-            # 2. 添加语义相关性
-            chunks = self.semantic_processor.compute_semantic_similarity(chunks)
+            for doc in documents:
+                # 1. 智能分块
+                chunks = self.chunker.create_chunks(doc.text)
+                chunks = self.semantic_processor.compute_semantic_similarity(chunks)
+                chunks = self.context_manager.add_context(chunks)
+                
+                # 4. 添加文档源信息和必要的元数据字段
+                for text, metadata in chunks:
+                    # 合并原有元数据和新的元数据
+                    enhanced_metadata = {
+                        # 基础元数据字段
+                        'source': doc.metadata.get('file_path', 'unknown'),
+                        'is_deleted': "0",  # 使用字符串"0"表示未删除
+                        'create_time': str(current_time),
+                        'file_type': doc.metadata.get('file_type', 'unknown'),
+                        'file_size': str(doc.metadata.get('file_size', 0)),
+                        'last_modified': str(current_time),
+                    }
+                    
+                    # 添加其他元数据，确保所有值都是字符串类型
+                    for k, v in metadata.items():
+                        if isinstance(v, (bool, int, float, str)):
+                            enhanced_metadata[k] = str(v)
+                    
+                    all_chunks.append((text, enhanced_metadata))
             
-            # 3. 添加上下文信息
-            chunks = self.context_manager.add_context(chunks)
+            # 验证元数据是否正确添加
+            if all_chunks:
+                # 打印示例元数据
+                logging.info("\n添加的元数据示例:")
+                logging.info(json.dumps(all_chunks[0][1], indent=2, ensure_ascii=False))
+                
+                # 查询数据库中的元数据
+                cursor.execute("""
+                    SELECT DISTINCT key 
+                    FROM embedding_metadata 
+                    ORDER BY key
+                """)
+                keys = cursor.fetchall()
+                logging.info("\n数据库中的元数据键:")
+                for key in keys:
+                    logging.info(f"- {key[0]}")
             
-            # 4. 添加文档源信息
-            for text, metadata in chunks:
-                metadata['source_document'] = doc.metadata
-                all_chunks.append((text, metadata))
-        
-        return all_chunks
+            cursor.close()
+            conn.close()
+            
+            return all_chunks
+            
+        except Exception as e:
+            logging.error(f"处理文档时出错: {str(e)}")
+            return all_chunks
+
+    def _print_metadata_info(self):
+        """打印元数据存储信息"""
+        try:
+            db_path = os.path.join('./chroma_db', 'chroma.sqlite3')
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # 1. 统计元数据信息
+            cursor.execute("""
+                SELECT COUNT(DISTINCT id) 
+                FROM embedding_metadata 
+                WHERE key = 'is_deleted' AND bool_value = 1
+            """)
+            deleted_count = cursor.fetchone()[0] or 0
+            
+            cursor.execute("SELECT COUNT(DISTINCT id) FROM embedding_metadata")
+            total_count = cursor.fetchone()[0] or 0
+            
+            logging.info(f"\n元数据统计:")
+            logging.info(f"- 总记录数: {total_count}")
+            logging.info(f"- 已删除记录: {deleted_count}")
+            logging.info(f"- 活跃记录: {total_count - deleted_count}")
+            
+            # 2. 打印示例记录
+            cursor.execute("""
+                SELECT DISTINCT id, key, string_value, int_value, float_value, bool_value
+                FROM embedding_metadata
+                LIMIT 20
+            """)
+            results = cursor.fetchall()
+            if results:
+                logging.info("\n元数据记录示例:")
+                current_id = None
+                metadata = {}
+                for id_, key, str_val, int_val, float_val, bool_val in results:
+                    if current_id != id_:
+                        if current_id is not None:
+                            logging.info(f"\nID: {current_id}")
+                            logging.info(f"Metadata: {metadata}")
+                        current_id = id_
+                        metadata = {}
+                    value = str_val or int_val or float_val or bool_val
+                    metadata[key] = value
+                
+                # 打印最后一条记录
+                if current_id is not None:
+                    logging.info(f"\nID: {current_id}")
+                    logging.info(f"Metadata: {metadata}")
+            
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logging.error(f"打印元数据信息时出错: {str(e)}")
 
 # 禁用 huggingface 的在线检查
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -1171,90 +1271,307 @@ class DocumentStore:
             print(f"Error initializing ChromaDB: {str(e)}")
             raise
             
-    def add_documents(self, 
-                     texts: List[str], 
-                     embeddings: List[List[float]], 
-                     metadatas: List[dict] = None,
-                     ids: List[str] = None):
-        """添加文档到存储"""
+    def add_documents(self, texts: List[str], embeddings: np.ndarray, metadatas: List[Dict[str, Any]], ids: Optional[List[str]] = None):
+        """添加文档到向量数据库"""
         try:
             if ids is None:
-                ids = [str(i) for i in range(len(texts))]
-                
-            print(f"Adding {len(texts)} documents to ChromaDB...")
+                ids = [f"doc_{i}_{int(time.time())}" for i in range(len(texts))]
             
-            # 检查输入数据
-            print(f"Texts count: {len(texts)}")
-            print(f"Embeddings count: {len(embeddings)}")
-            print(f"Metadata count: {len(metadatas) if metadatas else 0}")
-            print(f"IDs count: {len(ids)}")
+            current_time = int(time.time())
             
-            # 处理元数据，确保所有值都是基本类型
-            processed_metadatas = []
-            if metadatas:
-                for metadata in metadatas:
-                    # 创建新的扁平化元数据字典
-                    flat_metadata = {}
-                    for key, value in metadata.items():
-                        # 如果值是字典，跳过或提取基本类型值
-                        if isinstance(value, dict):
-                            # 将嵌套字典的键值对扁平化
-                            for nested_key, nested_value in value.items():
-                                if isinstance(nested_value, (str, int, float, bool)):
-                                    flat_metadata[f"{key}_{nested_key}"] = nested_value
-                        # 如果值是基本类型，直接添加
-                        elif isinstance(value, (str, int, float, bool)):
-                            flat_metadata[key] = value
-                        # 如果是其他类型，转换为字符串
-                        else:
-                            flat_metadata[key] = str(value)
-                    processed_metadatas.append(flat_metadata)
-            else:
-                processed_metadatas = [{}] * len(texts)
+            # 确保每个文档的元数据都包含必需字段
+            enhanced_metadatas = []
+            for i, meta in enumerate(metadatas):
+                # 创建基础元数据，移除保留关键字
+                enhanced_meta = {
+                    "chunk_id": ids[i],          # 块ID
+                    "file_id": meta.get("source", "unknown").split('/')[-1],  # 从源路径提取文件ID
+                    "file_name": meta.get("source", "unknown").split('/')[-1],  # 从源路径提取文件名
+                    "source": meta.get("source", "unknown"),  # 源路径
+                    "is_deleted": "0",           # 删除标记，使用字符串"0"
+                    "create_time": str(current_time),  # 创建时间
+                    "file_type": meta.get("file_type", "unknown"),  # 文件类型
+                    "file_size": str(meta.get("file_size", "0")),   # 文件大小
+                    "last_modified": str(current_time)  # 最后修改时间
+                }
+                enhanced_metadatas.append(enhanced_meta)
             
-            # 添加文档
+            # 打印第一条元数据作为示例
+            if enhanced_metadatas:
+                logging.info("\n添加文档的元数据示例:")
+                logging.info(json.dumps(enhanced_metadatas[0], indent=2, ensure_ascii=False))
+            
+            # 添加文档到数据库
             self.collection.add(
                 documents=texts,
-                embeddings=embeddings,
-                metadatas=processed_metadatas,
+                embeddings=embeddings.tolist() if isinstance(embeddings, np.ndarray) else embeddings,
+                metadatas=enhanced_metadatas,
                 ids=ids
             )
-            print(f"Successfully added documents to ChromaDB")
             
-            # 验证数据是否已保存
-            count = self.collection.count()
-            print(f"Total documents in collection: {count}")
+            # 验证元数据是否正确添加
+            db_path = os.path.join('./chroma_db', 'chroma.sqlite3')
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
             
-            # 检查存储目录内容
-            if os.path.exists(self.db_path):
-                print(f"ChromaDB directory contents:")
-                for root, dirs, files in os.walk(self.db_path):
-                    level = root.replace(self.db_path, '').count(os.sep)
-                    indent = ' ' * 4 * level
-                    print(f"{indent}{os.path.basename(root)}/")
-                    subindent = ' ' * 4 * (level + 1)
-                    for f in files:
-                        print(f"{subindent}{f}")
+            # 检查元数据字段
+            cursor.execute("""
+                SELECT DISTINCT key 
+                FROM embedding_metadata 
+                ORDER BY key
+            """)
+            keys = cursor.fetchall()
+            logging.info("\n数据库中的元数据键:")
+            for key in keys:
+                logging.info(f"- {key[0]}")
+            
+            # 检查is_deleted字段的数据
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM embedding_metadata 
+                WHERE key = 'is_deleted'
+            """)
+            count = cursor.fetchone()[0]
+            logging.info(f"\nis_deleted字段统计:")
+            logging.info(f"- 总记录数: {count}")
+            
+            cursor.close()
+            conn.close()
+            
+            logging.info(f"成功添加 {len(texts)} 个文档")
             
         except Exception as e:
-            print(f"Error adding documents to ChromaDB: {str(e)}")
-            print(f"Error details: {traceback.format_exc()}")
+            logging.error(f"添加文档时出错: {str(e)}")
+            logging.error(f"错误详情: {traceback.format_exc()}")
             raise
 
-    def count_documents_by_file_id(self, file_id):
-        """计算与特定文件ID相关的文档数量"""
+    def _print_collection_info(self):
+        """打印集合信息"""
         try:
-            # 查询与文件ID匹配的所有文档
+            db_path = os.path.join('./chroma_db', 'chroma.sqlite3')
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # 检查元数据表中的字段
+            cursor.execute("""
+                SELECT DISTINCT key, COUNT(*) as count
+                FROM embedding_metadata
+                GROUP BY key
+                ORDER BY key
+            """)
+            results = cursor.fetchall()
+            
+            logging.info("\n元数据字段统计:")
+            for key, count in results:
+                logging.info(f"- {key}: {count} 条记录")
+            
+            # 检查示例数据
+            cursor.execute("""
+                SELECT id, key, string_value
+                FROM embedding_metadata
+                WHERE key = 'is_deleted'
+                LIMIT 5
+            """)
+            samples = cursor.fetchall()
+            
+            if samples:
+                logging.info("\n示例记录:")
+                for id_, key, value in samples:
+                    logging.info(f"ID: {id_}, {key} = {value}")
+            
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logging.error(f"获取集合信息时出错: {str(e)}")
+
+    def delete_document(self, file_path: str) -> bool:
+        """
+        软删除文档（将is_deleted标记设为"1"）
+        
+        Args:
+            file_path: 文件路径，用于标识要删除的文档
+            
+        Returns:
+            bool: 删除是否成功
+        """
+        try:
+            logging.info(f"准备软删除文档: {file_path}")
+            
+            # 查找与文件路径匹配的所有文档
             results = self.collection.get(
-                where={"file_id": file_id},
-                include=["metadatas"]
+                where={"source": file_path}
             )
             
-            # 返回结果数量
-            return len(results['ids']) if results and 'ids' in results else 0
+            if not results or not results['ids']:
+                logging.warning(f"未找到与文件路径匹配的文档: {file_path}")
+                return False
+            
+            # 获取要更新的文档ID
+            doc_ids = results['ids']
+            logging.info(f"找到 {len(doc_ids)} 个要标记删除的文档")
+            
+            logging.info("更新is_deleted")
+
+            # 更新元数据，将is_deleted设置为"1"
+            for i, doc_id in enumerate(doc_ids):
+                self.collection.update(
+                    ids=[doc_id],
+                    metadatas=[{"is_deleted": "1"}]
+                )
+            
+            # 验证更新结果
+            verify_results = self.collection.get(
+                where={
+                    "$and": [
+                        {"source": file_path},
+                        {"is_deleted": "1"}
+                    ]
+                }
+            )
+            
+            success = len(verify_results['ids']) == len(doc_ids)
+            if success:
+                logging.info(f"文档软删除成功: {file_path}")
+            else:
+                logging.warning(f"部分文档可能未正确标记为删除状态")
+            
+            return success
+                
         except Exception as e:
-            print(f"计算文档数量时出错: {str(e)}")
+            logging.error(f"软删除文档时出错: {str(e)}")
+            logging.error(f"错误详情: {traceback.format_exc()}")
+            return False
+            
+    def get_documents(self, include_deleted: bool = False) -> List[Dict]:
+        """
+        获取文档列表，默认不包含已删除的文档
+        
+        Args:
+            include_deleted: 是否包含已删除的文档
+            
+        Returns:
+            List[Dict]: 文档列表
+        """
+        try:
+            where_clause = {} if include_deleted else {"is_deleted": "0"}
+            results = self.collection.get(
+                where=where_clause
+            )
+            return results
+            
+        except Exception as e:
+            logging.error(f"获取文档列表时出错: {str(e)}")
+            return []
+
+    def count_documents_by_file_id(self, file_id: str) -> int:
+        """
+        统计特定文件ID的文档数量（不包括已删除的文档）
+        
+        Args:
+            file_id: 文件ID
+            
+        Returns:
+            int: 文档数量
+        """
+        try:
+            # 构建查询条件：匹配file_id且未删除
+            results = self.collection.get(
+                where={
+                    "$and": [
+                        {"file_id": file_id},
+                        {"is_deleted": "0"}
+                    ]
+                }
+            )
+            
+            count = len(results['ids']) if results and 'ids' in results else 0
+            logging.info(f"文件 {file_id} 的有效文档数量: {count}")
+            return count
+            
+        except Exception as e:
+            logging.error(f"统计文档数量时出错: {str(e)}")
+            logging.error(f"错误详情: {traceback.format_exc()}")
             return 0
+            
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """
+        获取集合统计信息，包括已删除和未删除的文档数量
+        
+        Returns:
+            Dict: 包含集合统计信息的字典
+        """
+        try:
+            # 获取所有文档
+            all_results = self.collection.get()
+            
+            if not all_results or not all_results['metadatas']:
+                return {
+                    "total_documents": 0,
+                    "active_documents": 0,
+                    "deleted_documents": 0,
+                    "sources": []
+                }
+            
+            # 获取未删除的文档
+            active_results = self.collection.get(
+                where={"is_deleted": "0"}
+            )
+            
+            # 获取已删除的文档
+            deleted_results = self.collection.get(
+                where={"is_deleted": "1"}
+            )
+            
+            # 统计来源
+            sources = set()
+            for metadata in all_results['metadatas']:
+                if 'source' in metadata:
+                    sources.add(metadata['source'])
+            
+            return {
+                "total_documents": len(all_results['ids']),
+                "active_documents": len(active_results['ids']) if active_results else 0,
+                "deleted_documents": len(deleted_results['ids']) if deleted_results else 0,
+                "sources": list(sources)
+            }
+            
+        except Exception as e:
+            logging.error(f"获取集合统计信息时出错: {str(e)}")
+            return {
+                "error": str(e),
+                "total_documents": 0,
+                "active_documents": 0,
+                "deleted_documents": 0,
+                "sources": []
+            }
+            
+    def verify_document_exists(self, file_path: str) -> bool:
+        """
+        验证文档是否存在且未被删除
+        
+        Args:
+            file_path: 文件路径
+            
+        Returns:
+            bool: 文档是否存在且未被删除
+        """
+        try:
+            results = self.collection.get(
+                where={
+                    "$and": [
+                        {"source": file_path},
+                        {"is_deleted": "0"}
+                    ]
+                }
+            )
+            exists = len(results['ids']) > 0 if results else False
+            logging.info(f"文档 {file_path} 存在状态: {exists}")
+            return exists
+            
+        except Exception as e:
+            logging.error(f"验证文档存在时出错: {str(e)}")
+            return False
 
 def main():
     """主函数：完整的文档处理流程"""
@@ -1271,18 +1588,6 @@ def main():
     doc_store = DocumentStore()
     
     directory_path = "./documents"
-    
-    # 确保目录存在且包含文件
-    if not os.path.exists(directory_path):
-        logging.error(f"Directory not found: {directory_path}")
-        return
-        
-    files = os.listdir(directory_path)
-    if not files:
-        logging.error(f"No files found in directory: {directory_path}")
-        return
-        
-    logging.info(f"Found {len(files)} files in {directory_path}")
     
     try:
         # 1. 读取并处理文件
@@ -1302,48 +1607,67 @@ def main():
             all_docs.extend(docs)
         logging.info(f"合并后总文档数: {len(all_docs)}")
         
-        # 3. 文档切割
-        logging.info("=== 第3阶段: 文档切割 ===")
+        # 3. 文档切割和元数据处理
+        logging.info("=== 第3阶段: 文档切割和元数据处理 ===")
         chunks = doc_processor.process_documents(all_docs)
         logging.info(f"生成文本块数: {len(chunks)}")
+        
+        # 打印示例元数据
+        if chunks:
+            logging.info("\n示例文本块元数据:")
+            logging.info(json.dumps(chunks[0][1], indent=2, ensure_ascii=False))
         
         # 4. 生成向量
         logging.info("=== 第4阶段: 生成向量 ===")
         embeddings = embedding_model.encode([chunk[0] for chunk in chunks])
         logging.info(f"生成向量数: {len(embeddings)}")
         
-        # 5. 准备元数据
-        logging.info("=== 第5阶段: 准备元数据 ===")
-        metadatas = []
-        chunk_per_doc = len(chunks) // len(all_docs)
-        for i, doc in enumerate(all_docs):
-            file_path = doc.metadata.get('file_path', 'unknown')
-            # 为每个chunk创建对应的metadata
-            for _ in range(chunk_per_doc):
-                metadatas.append({
-                    "source": file_path,
-                    "doc_index": i,
-                    "total_docs": len(all_docs)
-                })
+        # 5. 存储到ChromaDB
+        logging.info("=== 第5阶段: 存储到ChromaDB ===")
+        chunk_ids = [f"chunk_{i}_{int(time.time())}" for i in range(len(chunks))]
         
-        # 如果chunks数量与metadata数量不匹配，进行调整
-        if len(metadatas) < len(chunks):
-            diff = len(chunks) - len(metadatas)
-            last_metadata = metadatas[-1]
-            metadatas.extend([last_metadata.copy() for _ in range(diff)])
-        elif len(metadatas) > len(chunks):
-            metadatas = metadatas[:len(chunks)]
-            
-        logging.info(f"准备元数据数: {len(metadatas)}")
+        # 确保所有元数据值都是字符串类型
+        processed_metadatas = []
+        for chunk in chunks:
+            metadata = chunk[1]
+            processed_metadata = {}
+            for k, v in metadata.items():
+                processed_metadata[k] = str(v)
+            processed_metadatas.append(processed_metadata)
         
-        # 6. 存储到ChromaDB
-        logging.info("=== 第6阶段: 存储到ChromaDB ===")
+        # 添加文档到ChromaDB
         doc_store.add_documents(
             texts=[chunk[0] for chunk in chunks],
             embeddings=embeddings,
-            metadatas=metadatas,
-            ids=[f"chunk_{i}" for i in range(len(chunks))]
+            metadatas=processed_metadatas,
+            ids=chunk_ids
         )
+        
+        # 验证元数据是否正确添加
+        logging.info("=== 验证元数据添加 ===")
+        db_path = os.path.join('./chroma_db', 'chroma.sqlite3')
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # 检查is_deleted字段
+        cursor.execute("""
+            SELECT COUNT(DISTINCT id) 
+            FROM embedding_metadata 
+            WHERE key = 'is_deleted'
+        """)
+        count = cursor.fetchone()[0]
+        logging.info(f"包含is_deleted字段的文档数: {count}")
+        
+        cursor.close()
+        conn.close()
+        
+        # 6. 验证存储结果
+        logging.info("=== 第6阶段: 验证存储结果 ===")
+        collection_info = doc_store.get_collection_info()
+        logging.info("\n存储结果统计:")
+        logging.info(f"- 总文档数: {collection_info['total_documents']}")
+        logging.info(f"- 活跃文档: {collection_info['active_documents']}")
+        logging.info(f"- 已删除文档: {collection_info['deleted_documents']}")
         
         logging.info(f"\n处理完成! 成功存储了 {len(chunks)} 个文本块")
         

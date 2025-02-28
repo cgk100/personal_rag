@@ -118,7 +118,7 @@ class LLMClient:
             max_tokens: 最大生成令牌数
             
         Returns:
-            流式聊天完成响应的生成器，包含知识库来源信息
+            流式聊天完成响应的生成器
         """
         try:
             # 获取最后一条用户消息
@@ -134,28 +134,24 @@ class LLMClient:
             embedding_model = TextEmbedding()
             query_embedding = embedding_model.encode([user_query])[0]
             
-            # 执行向量搜索，增加返回结果数量
+            # 执行向量搜索
             logger.info("\n执行向量搜索...")
             search_results = doc_store.collection.query(
                 query_embeddings=[query_embedding.tolist()],
-                n_results=10,  # 增加返回结果数量
+                n_results=10,
+                where={"is_deleted": {"$ne": "1"}},
                 include=['documents', 'metadatas', 'distances']
             )
             
-            # 记录搜索结果
-            logger.info("\n搜索结果:")
-            if len(search_results['documents'][0]) == 0:
-                logger.warning("没有找到任何匹配的文档")
+            # 检查是否有搜索结果
+            if not search_results['documents'] or len(search_results['documents'][0]) == 0:
+                logger.warning("没有找到匹配的文档")
+                yield "未找到相关内容，请尝试调整搜索关键词。"
+                return
             
-            for i, (doc, meta, distance) in enumerate(zip(
-                search_results['documents'][0],
-                search_results['metadatas'][0],
-                search_results['distances'][0]
-            )):
-                logger.info(f"\n结果 {i+1}:")
-                logger.info(f"  来源: {meta.get('source', '未知')}")
-                logger.info(f"  相似度距离: {distance}")
-                logger.info(f"  内容预览: {doc[:100]}...")
+            # 记录搜索结果数量
+            result_count = len(search_results['documents'][0])
+            logger.info(f"找到 {result_count} 个相关文档")
             
             # 处理搜索结果
             seen = set()
@@ -186,87 +182,49 @@ class LLMClient:
                         "source_path": source_path
                     })
             
-            # 如果没有找到文档，尝试关键词搜索
-            if not unique_docs and "管理办法" in user_query:
-                logger.info("\n尝试关键词搜索...")
-                all_docs = doc_store.collection.get()
-                for doc, meta in zip(all_docs['documents'], all_docs['metadatas']):
-                    source_path = meta.get('source', '')
-                    if '管理办法' in source_path and source_path not in seen:
-                        seen.add(source_path)
-                        unique_docs.append(doc)
-                        unique_metas.append(meta)
-                        logger.info(f"通过关键词找到文档: {source_path}")
-                        
-                        context += f"\n文档 {len(unique_docs)} (来源: {source_path}):\n{doc}\n"
-                        sources_data.append({
-                            "filename": os.path.basename(source_path),
-                            "content": doc[:500] + "..." if len(doc) > 500 else doc,
-                            "source_path": source_path
-                        })
-
             if not unique_docs:
-                logger.warning("\n没有找到相关文档")
-                yield "抱歉，我没有找到相关的参考信息。"
+                logger.warning("没有找到有效的唯一文档")
+                yield "未找到相关内容，请尝试调整搜索关键词。"
                 return
+                
+            # 构造提示词
+            prompt = f"""基于以下参考文档回答问题。如果无法从参考文档中找到相关信息，请明确说明。
 
-            logger.info(f"\n最终使用的文档数量: {len(unique_docs)}")
-            for i, meta in enumerate(unique_metas):
-                logger.info(f"文档 {i+1}: {meta.get('source', '未知')}")
-            
-            # 构建系统提示
-            system_prompt = f"""你是一个专业的助手。请基于以下参考文档回答问题。
 参考文档：
 {context}
 
 用户问题：{user_query}
-请给出详细的答案，确保回答专业、准确和客观。
-直接以Markdown格式输出内容，不要说明你在使用Markdown格式或者其他元描述。
+
+请给出详细的答案，使用markdown格式。确保回答专业、准确和客观。
 """
-            
-            # 创建增强的消息列表
-            augmented_messages = [
-                {"role": "system", "content": system_prompt}
-            ]
-            
-            # 添加用户最后一条消息
-            augmented_messages.append({"role": "user", "content": user_query})
-            
-            logger.info("发送增强消息到LLM")
+            logger.info("发送请求到LLM模型")
             
             # 创建流式响应
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=augmented_messages,
+                messages=[
+                    {"role": "system", "content": "你是一个知识渊博的助手，提供准确且有条理的回答。"},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=True,
                 temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True
+                max_tokens=max_tokens
             )
             
-            # 流式输出内容
-            content_buffer = ""
+            # 首先输出来源信息
+            sources_str = ", ".join([os.path.basename(source_path) for source_path in seen])
+            logger.info(f"使用的来源文件: {sources_str}")
+            yield f"(来源: {sources_str})\n\n"
             
+            # 返回流式响应
             for chunk in response:
                 if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    content_buffer += content
-                    yield content
-            
-            # 在内容后附加知识库来源信息
-            if sources_data:
-                # 记录源数据以便调试
-                logger.info(f"源数据详情: {json.dumps(sources_data, ensure_ascii=False)}")
-                
-                # 格式化知识库来源
-                sources_json = json.dumps(sources_data, ensure_ascii=False)
-                logger.info(f"输出知识库来源信息: {sources_json}")
-                yield f"\n\nSOURCES:{sources_json}"
-            
-            logger.info("流式响应完成")
-            
+                    yield chunk.choices[0].delta.content
+                    
         except Exception as e:
-            logger.error(f"流式聊天完成请求失败: {str(e)}", exc_info=True)
-            yield f"处理请求时出错: {str(e)}"
+            logger.error(f"处理查询时出错: {str(e)}", exc_info=True)
+            yield f"处理查询时发生错误: {str(e)}"
+
             
     def rag_search_completion(self, 
                              query: str, 
@@ -427,15 +385,25 @@ class DocumentProcessor:
         
     def process_documents(self, documents: List[Any]) -> List[tuple]:
         """处理文档并返回文本块"""
-        # 简单实现，实际应用中应该使用更复杂的分块策略
         chunks = []
         for doc in documents:
             text = doc.text if hasattr(doc, 'text') else str(doc)
-            # 简单分块
+            # 获取文档元数据
+            metadata = {
+                'source': doc.metadata.get('file_path', 'unknown') if hasattr(doc, 'metadata') else 'unknown',
+                'is_deleted': False,  # 添加删除标记
+                'create_time': int(time.time()),
+                'file_type': doc.metadata.get('file_type', 'unknown') if hasattr(doc, 'metadata') else 'unknown',
+                'file_size': doc.metadata.get('file_size', 0) if hasattr(doc, 'metadata') else 0,
+                'last_modified': doc.metadata.get('last_modified', int(time.time())) if hasattr(doc, 'metadata') else int(time.time())
+            }
+            
+            # 分块处理
             for i in range(0, len(text), self.chunk_size - self.chunk_overlap):
                 chunk = text[i:i + self.chunk_size]
                 if chunk:
-                    chunks.append((chunk, {'source': doc.metadata.get('file_path', 'unknown') if hasattr(doc, 'metadata') else 'unknown'}))
+                    chunks.append((chunk, metadata))
+                    
         return chunks
 
 
@@ -471,29 +439,54 @@ class DocumentStore:
             # 尝试获取已存在的集合
             self.collection = self.client.get_collection(name=collection_name)
             logger.info(f"成功获取已存在的集合: {collection_name}")
-            self._print_collection_info()
         except Exception as e:
             logger.info(f"集合不存在，创建新集合: {collection_name}")
-            self.collection = self.client.create_collection(name=collection_name)
+            self.collection = self.client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}  # 设置向量空间
+            )
+        
+        self._print_collection_info()
 
     def _print_collection_info(self):
-        """打印集合详细信息，用于调试"""
+        """打印集合详细信息，包括活跃和已删除文档的统计"""
         try:
-            count = self.collection.count()
             results = self.collection.get()
-            logger.info(f"集合中的文档数量: {count}")
+            total_count = len(results['ids']) if results.get('ids') else 0
+            
+            # 统计活跃和已删除的文档
+            active_count = 0
+            deleted_count = 0
+            
             if results and 'metadatas' in results:
-                logger.info("文档列表:")
-                for i, (doc, meta) in enumerate(zip(results['documents'], results['metadatas'])):
-                    logger.info(f"{i+1}. 源文件: {meta.get('source', '未知')}")
-                    logger.info(f"   内容预览: {doc[:100]}...")
+                for meta in results['metadatas']:
+                    if meta.get('is_deleted', False):
+                        deleted_count += 1
+                    else:
+                        active_count += 1
+            
+            logger.info(f"\n集合统计信息:")
+            logger.info(f"- 总文档数: {total_count}")
+            logger.info(f"- 活跃文档: {active_count}")
+            logger.info(f"- 已删除文档: {deleted_count}")
+            
+            # 打印部分文档示例
+            if results and 'metadatas' in results and results['metadatas']:
+                logger.info("\n文档示例:")
+                for i, (doc, meta) in enumerate(zip(results['documents'][:3], results['metadatas'][:3])):
+                    status = "已删除" if meta.get('is_deleted', False) else "活跃"
+                    logger.info(f"\n文档 {i+1}:")
+                    logger.info(f"- 状态: {status}")
+                    logger.info(f"- 来源: {meta.get('source', '未知')}")
+                    logger.info(f"- 内容预览: {doc[:100]}...")
+                
         except Exception as e:
             logger.error(f"获取集合信息时出错: {str(e)}")
 
     def delete_document(self, source_path: str) -> bool:
-        """删除指定源文件的所有文档"""
+        """通过标记方式逻辑删除文档"""
         try:
-            logger.info(f"开始删除文档: {source_path}")
+            logger.info(f"开始标记删除文档: {source_path}")
             
             # 1. 先检查文档是否存在
             try:
@@ -507,99 +500,129 @@ class DocumentStore:
                 }
                 logger.info(f"查询结果: {json.dumps(result_info, ensure_ascii=False)}")
                 
-                # 如果找到文档，记录其IDs
-                doc_ids = results.get('ids', [])
-                logger.info(f"找到的文档IDs: {doc_ids}")
+                if not results or len(results['ids']) == 0:
+                    logger.warning(f"未找到要删除的文档: {source_path}")
+                    return False
+                    
+                # 获取现有文档的信息
+                doc_ids = results['ids']
+                documents = results['documents']
+                metadatas = results['metadatas']
+                embeddings = results.get('embeddings', [])
+                
+                logger.info(f"找到 {len(doc_ids)} 个文档需要标记删除")
                 
             except Exception as e:
                 logger.error(f"查询文档时出错: {str(e)}", exc_info=True)
                 return False
             
-            if not results or len(results['ids']) == 0:
-                logger.warning(f"未找到要删除的文档: {source_path}")
-                return False
+            # 2. 更新元数据，添加删除标记
+            try:
+                # 为每个文档添加删除标记
+                new_metadatas = []
+                for meta in metadatas:
+                    new_meta = meta.copy()  # 复制原有元数据
+                    new_meta['is_deleted'] = 1  # 添加删除标记
+                    new_meta['delete_time'] = int(time.time())  # 添加删除时间
+                    new_metadatas.append(new_meta)
+                logger.info("is_deleted 更新完成")
+                # 先删除原有文档
+                self.collection.delete(ids=doc_ids)
                 
-            # 2. 记录删除前的文档数
-            try:
-                before_count = self.collection.count()
-                logger.info(f"删除前文档总数: {before_count}")
-            except Exception as e:
-                logger.error(f"获取文档数量时出错: {str(e)}", exc_info=True)
-                return False
-            
-            # 3. 尝试两种删除方式
-            try:
-                # 方式1: 使用where条件删除
-                self.collection.delete(
-                    where={"source": source_path}
+                # 重新添加带有删除标记的文档
+                self.collection.add(
+                    ids=doc_ids,
+                    documents=documents,
+                    metadatas=new_metadatas,
+                    embeddings=embeddings if embeddings else None
                 )
-                logger.info("方式1: where条件删除完成")
                 
-                # 方式2: 使用IDs删除
-                if doc_ids:
-                    self.collection.delete(
-                        ids=doc_ids
-                    )
-                    logger.info("方式2: IDs删除完成")
-                    
-                # 方式3: 强制重新加载集合
-                try:
-                    self.collection = self.client.get_collection(name=self.collection_name)
-                    logger.info("方式3: 重新加载集合完成")
-                except Exception as e:
-                    logger.error(f"重新加载集合失败: {str(e)}", exc_info=True)
+                logger.info(f"成功标记删除 {len(doc_ids)} 个文档")
                 
             except Exception as e:
-                logger.error(f"执行删除操作时出错: {str(e)}", exc_info=True)
+                logger.error(f"标记删除文档时出错: {str(e)}", exc_info=True)
                 return False
             
-            # 4. 验证删除结果
+            # 3. 验证更新结果
             try:
-                # 强制等待一小段时间，确保删除操作完成
-                import time
-                time.sleep(0.5)
-                
-                # 检查文档是否还存在
                 verify_results = self.collection.get(
-                    where={"source": source_path}
+                    where={
+                        "source": source_path,
+                        "is_deleted": True
+                    }
                 )
-                after_count = self.collection.count()
                 
-                logger.info(f"删除后状态:")
-                logger.info(f"- 总文档数: {after_count} (删除前: {before_count})")
-                logger.info(f"- 目标文档是否还存在: {len(verify_results['ids']) > 0}")
-                
-                if len(verify_results['ids']) > 0:
-                    logger.error(f"文档删除失败，仍能查询到文档: {source_path}")
-                    logger.error(f"残留文档信息: {json.dumps(verify_results, ensure_ascii=False)}")
-                    
-                    # 如果仍然存在，尝试最后的重置方法
-                    try:
-                        logger.info("尝试重置集合...")
-                        self.client.delete_collection(self.collection_name)
-                        self.collection = self.client.create_collection(name=self.collection_name)
-                        logger.info("集合重置完成")
-                    except Exception as e:
-                        logger.error(f"重置集合失败: {str(e)}", exc_info=True)
-                    
+                if len(verify_results['ids']) != len(doc_ids):
+                    logger.error(f"标记删除验证失败: 预期 {len(doc_ids)} 个文档，实际标记 {len(verify_results['ids'])} 个")
                     return False
                     
-                if after_count >= before_count:
-                    logger.error(f"文档总数未减少: 删除前={before_count}, 删除后={after_count}")
-                    return False
-                    
+                logger.info("标记删除验证成功")
+                
             except Exception as e:
-                logger.error(f"验证删除结果时出错: {str(e)}", exc_info=True)
+                logger.error(f"验证标记删除结果时出错: {str(e)}", exc_info=True)
                 return False
-                
-            logger.info(f"文档删除成功: {source_path}")
-            logger.info(f"删除前文档数: {before_count}, 删除后文档数: {after_count}")
             
             return True
             
         except Exception as e:
-            logger.error(f"删除文档过程中出错: {str(e)}", exc_info=True)
+            logger.error(f"标记删除过程中出错: {str(e)}", exc_info=True)
             return False
+
+    def query_documents(self, query_embedding: List[float], n_results: int = 5) -> Dict:
+        """查询文档时排除已删除的文档"""
+        try:
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results * 2,  # 多查询一些，因为有些可能被标记删除
+                where={"is_deleted": {"$ne": True}},  # 排除已删除的文档
+                include=['documents', 'metadatas', 'distances']
+            )
+            
+            # 只返回未删除的前 n_results 个结果
+            return {
+                'documents': results['documents'][0][:n_results],
+                'metadatas': results['metadatas'][0][:n_results],
+                'distances': results['distances'][0][:n_results]
+            }
+            
+        except Exception as e:
+            logger.error(f"查询文档时出错: {str(e)}")
+            return {'documents': [], 'metadatas': [], 'distances': []}
+
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """获取集合统计信息，区分活跃和已删除文档"""
+        try:
+            # 获取所有文档
+            all_results = self.collection.get()
+            
+            # 统计活跃和已删除的文档
+            active_sources = set()
+            deleted_sources = set()
+            
+            if all_results and 'metadatas' in all_results:
+                for metadata in all_results['metadatas']:
+                    if metadata and 'source' in metadata:
+                        if metadata.get('is_deleted', False):
+                            deleted_sources.add(metadata['source'])
+                        else:
+                            active_sources.add(metadata['source'])
+            
+            return {
+                "total_documents": len(all_results['ids']) if 'ids' in all_results else 0,
+                "active_documents": len(active_sources),
+                "deleted_documents": len(deleted_sources),
+                "active_sources": list(active_sources),
+                "deleted_sources": list(deleted_sources)
+            }
+        except Exception as e:
+            logger.error(f"获取集合统计信息时出错: {str(e)}")
+            return {
+                "total_documents": 0,
+                "active_documents": 0,
+                "deleted_documents": 0,
+                "active_sources": [],
+                "deleted_sources": []
+            }
 
     def add_documents(self, texts: List[str], embeddings: np.ndarray, metadatas: List[Dict[str, Any]], ids: Optional[List[str]] = None):
         """添加文档到向量数据库"""
@@ -607,22 +630,35 @@ class DocumentStore:
             if ids is None:
                 ids = [f"doc_{i}_{int(time.time())}" for i in range(len(texts))]
             
-            logger.info("开始添加新文档...")
-            logger.info(f"文档数量: {len(texts)}")
-            for i, (text, metadata) in enumerate(zip(texts, metadatas)):
-                logger.info(f"文档 {i+1}:")
-                logger.info(f"  源文件: {metadata.get('source', '未知')}")
-                logger.info(f"  内容预览: {text[:100]}...")
+            current_time = int(time.time())
             
-            # 添加新文档
+            # 确保每个文档的元数据都包含必需字段
+            enhanced_metadatas = []
+            for meta in metadatas:
+                enhanced_meta = {
+                    # 基础字段
+                    "source": meta.get("source", "unknown"),
+                    "is_deleted": False,  # 明确设置删除标记
+                    "create_time": current_time,
+                    "delete_time": None,  # 未删除时为None
+                    "file_type": meta.get("file_type", "unknown"),
+                    "file_size": meta.get("file_size", 0),
+                    "last_modified": meta.get("last_modified", current_time),
+                }
+                enhanced_metadatas.append(enhanced_meta)
+            
+            logger.info(f"添加文档，元数据示例:")
+            logger.info(json.dumps(enhanced_metadatas[0], indent=2, ensure_ascii=False))
+            
+            # 添加文档到数据库
             self.collection.add(
                 documents=texts,
                 embeddings=embeddings.tolist(),
-                metadatas=metadatas,
+                metadatas=enhanced_metadatas,
                 ids=ids
             )
             
-            logger.info("文档添加完成")
+            logger.info(f"成功添加 {len(texts)} 个文档")
             self._print_collection_info()
             
         except Exception as e:
@@ -661,32 +697,6 @@ class DocumentStore:
         except Exception as e:
             logger.error(f"同步文件系统时出错: {str(e)}")
             raise
-
-    def get_collection_stats(self) -> Dict[str, Any]:
-        """获取集合统计信息"""
-        try:
-            count = self.collection.count()
-            results = self.collection.get()
-            unique_sources = set()
-            
-            if results and 'metadatas' in results:
-                for metadata in results['metadatas']:
-                    if metadata and 'source' in metadata:
-                        source_path = metadata['source']
-                        unique_sources.add(source_path)
-            
-            return {
-                "total_documents": count,
-                "unique_sources": len(unique_sources),
-                "sources": list(unique_sources)
-            }
-        except Exception as e:
-            logger.error(f"获取集合统计信息时出错: {str(e)}")
-            return {
-                "total_documents": 0,
-                "unique_sources": 0,
-                "sources": []
-            }
 
     def process_file(self, file_path: str):
         """处理单个文件"""
