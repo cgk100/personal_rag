@@ -3,7 +3,7 @@
     <!-- 侧边栏 -->
     <el-aside :width="isCollapsed ? '64px' : '200px'" class="kb-sidebar">
       <div class="sidebar-header">
-        <h2 class="app-title" v-if="!isCollapsed">Ai知识库</h2>
+        <h2 class="app-title" v-if="!isCollapsed">金控助手</h2>
         <el-icon v-else class="collapsed-icon"><Document /></el-icon>
       </div>
       

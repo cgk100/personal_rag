@@ -2,7 +2,7 @@
   <div class="model-settings">
     <el-form label-position="top" size="small" class="settings-form">
       <el-form-item label="API 地址">
-        <el-input v-model="settings.baseUrl" placeholder="例如: https://api.openai.com/v1" />
+        <el-input v-model="settings.baseUrl" placeholder="例如: https://api.openai.com/v1" value="https://api.siliconflow.cn/v1"/>
       </el-form-item>
       
       <el-form-item label="API Key">
@@ -16,11 +16,8 @@
       <el-form-item label="模型">
         <el-select v-model="settings.selectedModel" class="full-width">
           <el-option label="GPT-3.5 Turbo" value="gpt-3.5-turbo" />
-          <el-option label="GPT-4" value="gpt-4" />
           <el-option label="DeepSeek-V3" value="deepseek-ai/DeepSeek-V3" />
-          <el-option label="Claude 3 Opus" value="claude-3-opus-20240229" />
-          <el-option label="Claude 3 Sonnet" value="claude-3-sonnet-20240229" />
-          <el-option label="Claude 3 Haiku" value="claude-3-haiku-20240307" />
+    
         </el-select>
       </el-form-item>
       

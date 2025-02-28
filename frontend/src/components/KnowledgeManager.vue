@@ -254,7 +254,7 @@ export default {
     
     const searchQuery = ref('');
     const fileTypeFilter = ref('all');
-    const viewMode = ref('grid');
+    const viewMode = ref('list');
     const uploadDialogVisible = ref(false);
     const fileList = ref([]);
     const uploadLoading = ref(false);

@@ -40,30 +40,70 @@
           
           <!-- 知识库来源展示 -->
           <div v-if="message.sources && message.sources.length > 0" class="message-sources">
-            <div class="sources-header">
-              <el-icon><Document /></el-icon>
-              <span>参考文档</span>
+            <div class="sources-header" @click="toggleSources(message)" :class="{ 'is-expanded': message.showSources }">
+              <span>找到了 {{ message.sources.length }} 篇知识库资料作为参考</span>
+              <el-icon class="arrow-icon" :class="{ 'is-expanded': message.showSources }">
+                <ArrowDown />
+              </el-icon>
             </div>
-            <ul class="sources-list">
-              <li v-for="(source, idx) in message.sources" :key="idx" class="source-item">
-                <el-tooltip :content="source.content" placement="top" :show-after="500">
-                  <div class="source-name">
-                    <el-icon><Document /></el-icon>
-                    <span class="filename">{{ formatFilename(source.filename || '未知文档') }}</span>
-                  </div>
-                </el-tooltip>
-              </li>
-            </ul>
+            <transition name="expand">
+              <div v-show="message.showSources" class="sources-list">
+                <div 
+                  v-for="(source, idx) in message.sources" 
+                  :key="idx" 
+                  class="source-item"
+                >
+                  <span class="source-number">{{ idx + 1 }}</span>
+                  <el-popover
+                    placement="top"
+                    :width="400"
+                    trigger="hover"
+                    :show-after="500"
+                    popper-class="source-popover"
+                  >
+                    <template #default>
+                      <div class="source-preview">
+                        <div class="preview-header">
+                          <el-icon><Document /></el-icon>
+                          <span>{{ source.filename }}</span>
+                        </div>
+                        <div class="preview-content">{{ source.content }}</div>
+                      </div>
+                    </template>
+                    <template #reference>
+                      <div class="source-name">
+                        {{ source.filename }}
+                      </div>
+                    </template>
+                  </el-popover>
+                </div>
+              </div>
+            </transition>
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- 添加一个返回底部的按钮 -->
+    <div 
+      v-show="userScrolling" 
+      class="scroll-to-bottom"
+      @click="scrollToBottomManually"
+    >
+      <el-button 
+        type="primary" 
+        circle
+        size="small"
+      >
+        <el-icon><ArrowDown /></el-icon>
+      </el-button>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, watch, nextTick, onMounted } from 'vue'
-import { User, ChatRound, Document } from '@element-plus/icons-vue'
+import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { User, ChatRound, Document, ArrowDown } from '@element-plus/icons-vue'
 
 // 使用全局变量
 // 注意：CDN 加载的 marked 是一个对象，不是函数
@@ -98,12 +138,44 @@ const props = defineProps({
 // 状态变量
 const chatContainer = ref(null)
 
-// 滚动到底部函数
+// 添加一个变量来追踪是否用户正在查看历史消息
+const userScrolling = ref(false)
+const lastScrollTop = ref(0)
+
+// 监听滚动事件
+const handleScroll = () => {
+  if (!chatContainer.value) return
+  
+  const { scrollTop, scrollHeight, clientHeight } = chatContainer.value
+  const isAtBottom = scrollHeight - scrollTop - clientHeight < 50 // 50px 的缓冲区
+  
+  // 记录最后的滚动位置
+  lastScrollTop.value = scrollTop
+  
+  // 如果用户向上滚动，标记为正在查看历史消息
+  if (!isAtBottom) {
+    userScrolling.value = true
+  } else {
+    userScrolling.value = false
+  }
+}
+
+// 修改滚动到底部的函数
 const scrollToBottom = async () => {
   await nextTick()
-  if (chatContainer.value) {
+  if (!chatContainer.value) return
+  
+  // 只有在用户没有查看历史消息，或者本来就在底部时才自动滚动
+  if (!userScrolling.value || 
+      (chatContainer.value.scrollHeight - lastScrollTop.value - chatContainer.value.clientHeight < 150)) {
     chatContainer.value.scrollTop = chatContainer.value.scrollHeight
   }
+}
+
+// 添加手动滚动到底部的函数
+const scrollToBottomManually = () => {
+  userScrolling.value = false
+  scrollToBottom()
 }
 
 // 监听消息变化，自动滚动到底部
@@ -171,23 +243,24 @@ const renderMarkdown = (text) => {
   }
 }
 
-// 格式化文件名，移除路径和UUID前缀
-const formatFilename = (filename) => {
-  // 移除路径
-  let name = filename.split('/').pop();
-  
-  // 如果文件名包含UUID格式，则尝试提取原始文件名
-  if (/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/.test(name)) {
-    // 如果是完整路径，只保留文件名部分
-    return name;
-  }
-  
-  return name;
+// 添加切换展开/折叠的方法
+const toggleSources = (message) => {
+  message.showSources = !message.showSources
 }
 
-// 在组件挂载后滚动到底部
+// 在组件挂载时添加滚动事件监听
 onMounted(() => {
-  scrollToBottom()
+  if (chatContainer.value) {
+    chatContainer.value.addEventListener('scroll', handleScroll)
+    scrollToBottom()
+  }
+})
+
+// 在组件卸载时移除事件监听
+onUnmounted(() => {
+  if (chatContainer.value) {
+    chatContainer.value.removeEventListener('scroll', handleScroll)
+  }
 })
 </script>
 
@@ -195,7 +268,9 @@ onMounted(() => {
 .chat-history {
   height: 100%;
   overflow-y: auto;
+  scroll-behavior: smooth; /* 添加平滑滚动效果 */
   padding: var(--spacing-medium);
+  position: relative; /* 为固定定位的滚动按钮提供参考 */
   font-size: 14px;  /* 减小字体大小 */
   line-height: 1.6; /* 增加行间距 */
 }
@@ -412,56 +487,134 @@ onMounted(() => {
 
 /* 知识库来源样式 */
 .message-sources {
-  margin-top: 10px;
-  font-size: 12px; /* 减小字体大小 */
-  color: var(--color-text-secondary);
-  background-color: var(--color-background-light);
-  border-radius: 8px; /* 增加圆角 */
-  padding: 8px 12px; /* 调整内边距 */
-  border-left: 2px solid var(--color-primary);
+  margin-top: 12px;
+  font-size: 14px;
+  color: var(--color-text-regular);
   width: 100%;
   box-sizing: border-box;
 }
 
 .sources-header {
-  font-weight: 600;
-  margin-bottom: 6px;
   display: flex;
   align-items: center;
-  gap: 4px;
-  color: var(--color-primary);
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  user-select: none;
+  padding: 8px;
+  border-radius: 4px;
+  transition: all 0.3s ease;
+}
+
+.sources-header:hover {
+  background-color: var(--color-background-light);
+}
+
+.arrow-icon {
+  transition: transform 0.3s ease;
+}
+
+.arrow-icon.is-expanded {
+  transform: rotate(180deg);
 }
 
 .sources-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 8px;
+}
+
+/* 展开动画 */
+.expand-enter-active,
+.expand-leave-active {
+  transition: all 0.3s ease;
+  overflow: hidden;
+}
+
+.expand-enter-from,
+.expand-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
+  height: 0;
 }
 
 .source-item {
   display: flex;
   align-items: center;
-  background-color: var(--color-white);
+  gap: 8px;
+  padding: 8px 12px;
+  background-color: var(--el-fill-color-light);
   border-radius: 4px;
-  padding: 3px 6px; /* 减小内边距 */
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03); /* 减轻阴影 */
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.source-item:hover {
+  background-color: var(--el-fill-color);
+}
+
+.source-number {
+  color: var(--el-color-primary);
+  font-weight: 500;
+  min-width: 16px;
 }
 
 .source-name {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  cursor: pointer;
-  color: var(--color-primary);
-}
-
-.filename {
-  max-width: 180px;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--el-text-color-regular);
+}
+
+/* Popover 样式 */
+:deep(.source-popover) {
+  padding: 0;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.source-preview {
+  max-width: 400px;
+}
+
+.preview-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  font-weight: 500;
+  color: var(--el-text-color-primary);
+  background-color: var(--el-fill-color-lighter);
+  border-radius: 8px 8px 0 0;
+}
+
+.preview-content {
+  padding: 16px;
+  line-height: 1.6;
+  color: var(--el-text-color-regular);
+  font-size: 14px;
+  max-height: 300px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  background-color: var(--el-bg-color);
+  border-radius: 0 0 8px 8px;
+}
+
+.scroll-to-bottom {
+  position: fixed;
+  bottom: 100px;
+  right: 30px;
+  z-index: 99;
+  cursor: pointer;
+  transition: opacity 0.3s;
+  opacity: 0.6;
+}
+
+.scroll-to-bottom:hover {
+  opacity: 1;
 }
 </style> 
